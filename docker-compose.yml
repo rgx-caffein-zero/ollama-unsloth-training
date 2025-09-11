@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  ollama-unsloth:
+    build: .
+    container_name: ollama-unsloth-training
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_MODELS=/workspace/models/ollama
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+      - OLLAMA_GPU_OVERHEAD=1073741824
+    volumes:
+      - ./data:/workspace/data
+      - ./models:/workspace/models
+      - ./scripts:/workspace/scripts
+      - ./notebooks:/workspace/notebooks
+      - ollama-data:/root/.ollama
+    ports:
+      - "11434:11434"  # Ollama API
+      - "8888:8888"    # Jupyter Notebook
+    shm_size: '8gb'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  ollama-data:
