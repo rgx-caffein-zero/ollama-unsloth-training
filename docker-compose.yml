@@ -9,8 +9,12 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - OLLAMA_HOST=0.0.0.0
       - OLLAMA_MODELS=/workspace/models/ollama
-      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
-      - OLLAMA_GPU_OVERHEAD=1073741824
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_GPU_OVERHEAD=1073741824  # 1GB reserved
+      - CUDA_VISIBLE_DEVICES=0
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb=128:expandable_segments=True
+      - TRANSFORMERS_CACHE=/workspace/models/cache
+      - HF_HOME=/workspace/models/huggingface
     volumes:
       - ./data:/workspace/data
       - ./models:/workspace/models
@@ -18,16 +22,18 @@ services:
       - ./notebooks:/workspace/notebooks
       - ollama-data:/root/.ollama
     ports:
-      - "11434:11434"  # Ollama API
-      - "8888:8888"    # Jupyter Notebook
-    shm_size: '8gb'
+      - "11434:11434"
+      - "8888:8888"
+    shm_size: '12gb'
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              count: 1
               capabilities: [gpu]
+        limits:
+          memory: 32g
 
 volumes:
   ollama-data:

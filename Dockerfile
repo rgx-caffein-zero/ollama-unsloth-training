@@ -15,6 +15,8 @@ RUN apt-get update && apt-get install -y \
     curl \
     wget \
     vim \
+    htop \
+    nvtop \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
@@ -29,8 +31,12 @@ COPY requirements.txt .
 RUN pip3 install --upgrade pip && \
     pip3 install -r requirements.txt
 
-# Unslothのインストール（最新版）
+# Unslothの最新版インストール
 RUN pip3 install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+RUN pip3 install --upgrade xformers
+
+# Flash Attention 2のインストール
+RUN pip3 install flash-attn --no-build-isolation
 
 # スクリプトとディレクトリのコピー
 COPY scripts/ ./scripts/

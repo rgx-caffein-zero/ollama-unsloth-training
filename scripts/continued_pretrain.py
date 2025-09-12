@@ -3,18 +3,29 @@
 """
 import os
 import torch
-from datasets import load_dataset
-from transformers import TrainingArguments, AutoTokenizer
+import gc
+from datasets import load_dataset, Dataset
+from transformers import TrainingArguments
 from trl import SFTTrainer
 from unsloth import FastLanguageModel
 
-def load_model_for_continued_pretraining(model_name="unsloth/llama-2-7b", max_seq_length=4096):
+def cleanup_memory():
+    """メモリのクリーンアップ"""
+    gc.collect()
+    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+def load_model_for_pretraining(model_name="unsloth/llama-2-7b", max_seq_length=4096):
     """継続事前学習用のモデル読み込み"""
+    cleanup_memory()
+    
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_name,
         max_seq_length=max_seq_length,
-        dtype=None,
+        dtype=torch.float16,
         load_in_4bit=True,
+        device_map="auto",
     )
     
     # 継続事前学習用のLoRA設定（より大きなrankを使用）
@@ -27,8 +38,9 @@ def load_model_for_continued_pretraining(model_name="unsloth/llama-2-7b", max_se
         lora_alpha=32,
         lora_dropout=0,
         bias="none",
-        use_gradient_checkpointing=True,
+        use_gradient_checkpointing="unsloth",
         random_state=3407,
+        max_seq_length=max_seq_length,
     )
     
     return model, tokenizer
@@ -45,40 +57,62 @@ def prepare_pretraining_dataset(data_path, tokenizer, max_seq_length=4096):
     else:
         dataset = load_dataset(data_path, split='train')
     
-    # トークナイズ関数
-    def tokenize_function(examples):
-        return tokenizer(
-            examples["text"],
-            padding="max_length",
-            truncation=True,
-            max_length=max_seq_length,
-            return_tensors="pt"
-        )
+    # 長さ制限を適用
+    def process_function(examples):
+        texts = examples["text"]
+        processed_texts = []
+        for text in texts:
+            if len(tokenizer.encode(text)) > max_seq_length:
+                text = text[:max_seq_length * 3]  # 概算でカット
+            processed_texts.append(text)
+        return {"text": processed_texts}
     
-    # データセットのトークナイズ
-    tokenized_dataset = dataset.map(
-        tokenize_function,
+    dataset = dataset.map(
+        process_function,
         batched=True,
         num_proc=4,
-        remove_columns=dataset.column_names
     )
     
-    return tokenized_dataset
+    return dataset
 
 def continued_pretrain(model, tokenizer, dataset, output_dir="/workspace/models/continued_pretrained"):
     """継続事前学習の実行"""
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # GPU VRAMに基づいて自動調整
+    gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.is_available() else 0
+    
+    # VRAMに基づく設定の自動調整
+    if gpu_memory >= 24:
+        batch_size = 2
+        gradient_accumulation = 4
+        max_seq = 4096
+    elif gpu_memory >= 16:
+        batch_size = 2
+        gradient_accumulation = 4
+        max_seq = 3072
+    elif gpu_memory >= 10:
+        batch_size = 1
+        gradient_accumulation = 8
+        max_seq = 2048
+    else:
+        batch_size = 1
+        gradient_accumulation = 16
+        max_seq = 1024
+    
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=1,  # 継続事前学習は通常1エポック
-        per_device_train_batch_size=2,  # より大きなシーケンス長のため小さめに
-        gradient_accumulation_steps=8,
+        per_device_train_batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation,
         warmup_steps=100,
         max_steps=1000,
         learning_rate=5e-5,  # 継続事前学習では低めの学習率
-        fp16=not torch.cuda.is_bf16_supported(),
-        bf16=torch.cuda.is_bf16_supported(),
+        fp16=True,
+        bf16=False if gpu_memory < 16 else torch.cuda.is_bf16_supported(),
         logging_steps=20,
-        optim="adamw_8bit",
+        optim="paged_adamw_8bit",
         weight_decay=0.01,
         lr_scheduler_type="cosine",
         seed=3407,
@@ -88,6 +122,7 @@ def continued_pretrain(model, tokenizer, dataset, output_dir="/workspace/models/
         push_to_hub=False,
         report_to="tensorboard",
         logging_dir=f"{output_dir}/logs",
+        gradient_checkpointing=True,
     )
     
     trainer = SFTTrainer(
@@ -95,7 +130,7 @@ def continued_pretrain(model, tokenizer, dataset, output_dir="/workspace/models/
         tokenizer=tokenizer,
         train_dataset=dataset,
         dataset_text_field="text",
-        max_seq_length=4096,
+        max_seq_length=min(max_seq, 4096),
         dataset_num_proc=4,
         packing=True,  # 継続事前学習では効率化のためpackingを使用
         args=training_args,
@@ -103,6 +138,7 @@ def continued_pretrain(model, tokenizer, dataset, output_dir="/workspace/models/
     
     # 訓練開始
     print("Starting continued pre-training...")
+    print(f"Batch size: {batch_size}, Max sequence: {max_seq}")
     trainer.train()
     
     # モデルの保存
@@ -118,21 +154,21 @@ def continued_pretrain(model, tokenizer, dataset, output_dir="/workspace/models/
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Continued pre-training using Unsloth")
+    parser = argparse.ArgumentParser(description="Continued pre-training")
     parser.add_argument("--model", type=str, default="unsloth/llama-2-7b",
                        help="Base model name or path to finetuned model")
     parser.add_argument("--data", type=str, required=True,
                        help="Path to pre-training data")
     parser.add_argument("--output", type=str, default="/workspace/models/continued_pretrained",
-                       help="Output directory for continued pre-trained model")
+                       help="Output directory")
     parser.add_argument("--max-seq-length", type=int, default=4096,
-                       help="Maximum sequence length for pre-training")
+                       help="Maximum sequence length")
     
     args = parser.parse_args()
     
     # モデルとトークナイザーの読み込み
     print(f"Loading model: {args.model}")
-    model, tokenizer = load_model_for_continued_pretraining(args.model, args.max_seq_length)
+    model, tokenizer = load_model_for_pretraining(args.model, args.max_seq_length)
     
     # データセットの準備
     print(f"Preparing dataset from: {args.data}")
