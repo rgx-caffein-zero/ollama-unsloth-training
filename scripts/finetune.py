@@ -1,5 +1,5 @@
 """
-ファインチューニングスクリプト
+ファインチューニングスクリプト (RTX 2080 Ti 12GB VRAM最適化版)
 """
 import os
 import torch
@@ -20,11 +20,14 @@ def cleanup_memory():
 
 def load_model(model_name="unsloth/mistral-7b-instruct-v0.2-bnb-4bit", 
                max_seq_length=2048):
-    """モデル読み込み"""
+    """モデル読み込み (12GB VRAM最適化)"""
     cleanup_memory()
     
     print(f"Loading model: {model_name}")
     print(f"Max sequence length: {max_seq_length}")
+    
+    # 12GB VRAMではmax_seq_lengthを2048に制限
+    max_seq_length = min(max_seq_length, 2048)
     
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_name,
@@ -35,10 +38,10 @@ def load_model(model_name="unsloth/mistral-7b-instruct-v0.2-bnb-4bit",
         trust_remote_code=True,
     )
     
-    # LoRA設定
+    # LoRA設定 (12GB用に控えめに)
     model = FastLanguageModel.get_peft_model(
         model,
-        r=16,  # デフォルトrank
+        r=16,  # rank 16で固定
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                        "gate_proj", "up_proj", "down_proj"],
         lora_alpha=16,
@@ -53,6 +56,9 @@ def load_model(model_name="unsloth/mistral-7b-instruct-v0.2-bnb-4bit",
 
 def prepare_dataset(data_path, tokenizer, max_seq_length=2048):
     """データセット準備"""
+    
+    # 12GB VRAMではmax_seq_lengthを2048に制限
+    max_seq_length = min(max_seq_length, 2048)
     
     # データ読み込み
     if data_path.endswith('.jsonl'):
@@ -85,9 +91,12 @@ def prepare_dataset(data_path, tokenizer, max_seq_length=2048):
                 # inputがない場合のフォーマット
                 text = f"### Instruction:\n{instruction}\n\n### Response:\n{output}"
             
-            # 長さ制限
-            if len(tokenizer.encode(text)) > max_seq_length:
-                text = text[:max_seq_length * 3]  # 概算でカット
+            # 長さ制限 (12GB用に厳しく)
+            tokens = tokenizer.encode(text)
+            if len(tokens) > max_seq_length:
+                # トークン数で正確にカット
+                tokens = tokens[:max_seq_length]
+                text = tokenizer.decode(tokens, skip_special_tokens=True)
             
             texts.append(text)
         
@@ -103,55 +112,71 @@ def prepare_dataset(data_path, tokenizer, max_seq_length=2048):
     print(f"Dataset size: {len(dataset)} samples")
     return dataset
 
-def train(model, tokenizer, dataset, output_dir="/workspace/models/finetuned"):
-    """訓練設定と実行"""
+def train(model, tokenizer, dataset, output_dir="/workspace/models/finetuned", 
+          batch_size_override=None, epochs=3):
+    """訓練設定と実行 (RTX 2080 Ti 12GB最適化)"""
     
     os.makedirs(output_dir, exist_ok=True)
     
     # GPU VRAMに基づいて自動調整
     gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.is_available() else 0
     
-    # VRAMに基づくバッチサイズの自動調整
+    # 12GB VRAM専用設定 (より保守的に)
     if gpu_memory >= 24:
         batch_size = 4
         gradient_accumulation = 4
+        max_seq = 2048
     elif gpu_memory >= 16:
-        batch_size = 3
-        gradient_accumulation = 5
-    elif gpu_memory >= 10:
         batch_size = 2
         gradient_accumulation = 8
-    else:
+        max_seq = 2048
+    elif gpu_memory >= 11:  # RTX 2080 Ti (12GB)用
         batch_size = 1
         gradient_accumulation = 16
+        max_seq = 2048
+    elif gpu_memory >= 8:
+        batch_size = 1
+        gradient_accumulation = 16
+        max_seq = 1024
+    else:
+        batch_size = 1
+        gradient_accumulation = 32
+        max_seq = 512
     
-    print(f"Auto-configured batch size: {batch_size}, gradient accumulation: {gradient_accumulation}")
+    # オーバーライド
+    if batch_size_override is not None:
+        batch_size = batch_size_override
+    
+    print(f"Auto-configured for {gpu_memory:.1f}GB VRAM:")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Gradient accumulation: {gradient_accumulation}")
+    print(f"  Max sequence length: {max_seq}")
     
     training_args = TrainingArguments(
         output_dir=output_dir,
-        num_train_epochs=3,
+        num_train_epochs=epochs,
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation,
         warmup_steps=20,
-        max_steps=-1,  # 全データを使用
+        max_steps=-1,
         learning_rate=2e-4,
-        fp16=True,  # FP16使用
-        bf16=False if gpu_memory < 16 else torch.cuda.is_bf16_supported(),
+        fp16=True,
+        bf16=False,  # RTX 2080 TiはBF16非対応
         logging_steps=10,
-        optim="paged_adamw_8bit",  # 8bitオプティマイザ
+        optim="paged_adamw_8bit",
         weight_decay=0.01,
         lr_scheduler_type="cosine",
         seed=3407,
         save_strategy="epoch",
         save_total_limit=2,
-        load_best_model_at_end=True,
+        load_best_model_at_end=False,  # メモリ節約のため無効化
         ddp_find_unused_parameters=False,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         max_grad_norm=0.3,
         report_to="tensorboard",
         logging_dir=f"{output_dir}/logs",
-        dataloader_pin_memory=True,
+        dataloader_pin_memory=False,  # メモリ節約
         dataloader_num_workers=2,
     )
     
@@ -161,7 +186,7 @@ def train(model, tokenizer, dataset, output_dir="/workspace/models/finetuned"):
         tokenizer=tokenizer,
         train_dataset=dataset,
         dataset_text_field="text",
-        max_seq_length=2048,
+        max_seq_length=max_seq,
         dataset_num_proc=2,
         packing=False,  # 安定性重視
         args=training_args,
@@ -171,9 +196,9 @@ def train(model, tokenizer, dataset, output_dir="/workspace/models/finetuned"):
     print("\n=== Training Configuration ===")
     print(f"Model: {model.config._name_or_path if hasattr(model.config, '_name_or_path') else 'Custom'}")
     print(f"Dataset size: {len(dataset)} samples")
-    print(f"Batch size: {training_args.per_device_train_batch_size}")
-    print(f"Gradient accumulation: {training_args.gradient_accumulation_steps}")
+    print(f"Effective batch size: {batch_size * gradient_accumulation}")
     print(f"Total epochs: {training_args.num_train_epochs}")
+    print(f"Steps per epoch: ~{len(dataset) // (batch_size * gradient_accumulation)}")
     print(f"Initial GPU memory: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
     print("================================\n")
     
@@ -202,16 +227,18 @@ def train(model, tokenizer, dataset, output_dir="/workspace/models/finetuned"):
         
     except torch.cuda.OutOfMemoryError as e:
         print(f"\n❌ OOM Error: {e}")
-        print("Suggestions:")
-        print("  1. Reduce batch_size")
-        print("  2. Reduce max_seq_length")
-        print("  3. Reduce LoRA rank")
-        print("  4. Enable CPU offloading")
+        print("\n12GB VRAM用の推奨設定:")
+        print("  1. --batch-size 1 を使用")
+        print("  2. --max-seq-length 1024 に削減")
+        print("  3. gradient_accumulation を増やす")
+        print("  4. より小さいモデル (gemma-2b) を使用")
         cleanup_memory()
+        raise
         
     except Exception as e:
         print(f"\n❌ Training error: {e}")
         cleanup_memory()
+        raise
         
     finally:
         cleanup_memory()
@@ -220,7 +247,7 @@ def train(model, tokenizer, dataset, output_dir="/workspace/models/finetuned"):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Finetune model")
+    parser = argparse.ArgumentParser(description="Finetune model for RTX 2080 Ti")
     parser.add_argument("--model", type=str, 
                        default="unsloth/mistral-7b-instruct-v0.2-bnb-4bit",
                        help="Model name")
@@ -230,18 +257,25 @@ if __name__ == "__main__":
                        default="/workspace/models/finetuned",
                        help="Output directory")
     parser.add_argument("--max-seq-length", type=int, default=2048,
-                       help="Maximum sequence length")
+                       help="Maximum sequence length (max 2048 for 12GB)")
     parser.add_argument("--batch-size", type=int, default=None,
-                       help="Override auto batch size")
+                       help="Override auto batch size (1 recommended for 12GB)")
     parser.add_argument("--epochs", type=int, default=3,
                        help="Number of training epochs")
-    parser.add_argument("--lora-r", type=int, default=16,
-                       help="LoRA rank")
     
     args = parser.parse_args()
     
     # メモリクリア
     cleanup_memory()
+    
+    # GPU確認
+    if torch.cuda.is_available():
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"Detected GPU: {torch.cuda.get_device_name(0)}")
+        print(f"VRAM: {gpu_mem:.1f} GB\n")
+        
+        if gpu_mem < 11:
+            print("⚠️ Warning: Less than 11GB VRAM. Consider using smaller model or settings.")
     
     # モデルとトークナイザーの読み込み
     print(f"Loading model: {args.model}")
@@ -252,4 +286,4 @@ if __name__ == "__main__":
     dataset = prepare_dataset(args.data, tokenizer, args.max_seq_length)
     
     # 訓練
-    train(model, tokenizer, dataset, args.output)
+    train(model, tokenizer, dataset, args.output, args.batch_size, args.epochs)
