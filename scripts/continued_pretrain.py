@@ -1,5 +1,5 @@
 """
-継続事前学習スクリプト (RTX 2080 Ti 12GB VRAM最適化版)
+継続事前学習スクリプト (10.8GB VRAM最適化版)
 """
 import os
 import torch
@@ -16,12 +16,12 @@ def cleanup_memory():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
-def load_model_for_pretraining(model_name="unsloth/llama-2-7b", max_seq_length=2048):
-    """継続事前学習用のモデル読み込み (12GB VRAM最適化)"""
+def load_model_for_pretraining(model_name="unsloth/llama-2-7b", max_seq_length=1024):
+    """継続事前学習用のモデル読み込み (10.8GB VRAM最適化)"""
     cleanup_memory()
     
-    # 12GB VRAMではmax_seq_lengthを2048に制限
-    max_seq_length = min(max_seq_length, 2048)
+    # 10.8GB VRAMではmax_seq_lengthを1536に制限
+    max_seq_length = min(max_seq_length, 1536)
     
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_name,
@@ -31,10 +31,10 @@ def load_model_for_pretraining(model_name="unsloth/llama-2-7b", max_seq_length=2
         device_map="auto",
     )
     
-    # 継続事前学習用のLoRA設定 (12GB用に控えめに)
+    # 継続事前学習用のLoRA設定 (10.8GB用に削減)
     model = FastLanguageModel.get_peft_model(
         model,
-        r=32,  # 12GB用にrankを32に削減
+        r=16,  # 10.8GB用にrankを16に削減
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                        "gate_proj", "up_proj", "down_proj"],
         lora_alpha=16,
@@ -47,11 +47,11 @@ def load_model_for_pretraining(model_name="unsloth/llama-2-7b", max_seq_length=2
     
     return model, tokenizer
 
-def prepare_pretraining_dataset(data_path, tokenizer, max_seq_length=2048):
+def prepare_pretraining_dataset(data_path, tokenizer, max_seq_length=1024):
     """継続事前学習用データセットの準備"""
     
-    # 12GB VRAMではmax_seq_lengthを2048に制限
-    max_seq_length = min(max_seq_length, 2048)
+    # 10.8GB VRAMではmax_seq_lengthを1536に制限
+    max_seq_length = min(max_seq_length, 1536)
     
     # テキストファイルまたはJSONLファイルからデータを読み込む
     if data_path.endswith('.txt'):
@@ -79,20 +79,20 @@ def prepare_pretraining_dataset(data_path, tokenizer, max_seq_length=2048):
     dataset = dataset.map(
         process_function,
         batched=True,
-        num_proc=4,
+        num_proc=2,
     )
     
     return dataset
 
 def continued_pretrain(model, tokenizer, dataset, output_dir="/workspace/models/continued_pretrained"):
-    """継続事前学習の実行 (RTX 2080 Ti 12GB最適化)"""
+    """継続事前学習の実行 (10.8GB VRAM最適化)"""
     
     os.makedirs(output_dir, exist_ok=True)
     
     # GPU VRAMに基づいて自動調整
     gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.is_available() else 0
     
-    # 12GB VRAM専用設定
+    # VRAM別設定
     if gpu_memory >= 24:
         batch_size = 2
         gradient_accumulation = 4
@@ -101,17 +101,21 @@ def continued_pretrain(model, tokenizer, dataset, output_dir="/workspace/models/
         batch_size = 2
         gradient_accumulation = 4
         max_seq = 2048
-    elif gpu_memory >= 11:  # RTX 2080 Ti (12GB)用
+    elif gpu_memory >= 12:
         batch_size = 1
         gradient_accumulation = 8
         max_seq = 2048
-    elif gpu_memory >= 8:
+    elif gpu_memory >= 10:  # 10.8GB用
         batch_size = 1
         gradient_accumulation = 16
         max_seq = 1024
-    else:
+    elif gpu_memory >= 8:
         batch_size = 1
         gradient_accumulation = 32
+        max_seq = 1024
+    else:
+        batch_size = 1
+        gradient_accumulation = 64
         max_seq = 512
     
     print(f"Auto-configured for {gpu_memory:.1f}GB VRAM:")
@@ -124,24 +128,25 @@ def continued_pretrain(model, tokenizer, dataset, output_dir="/workspace/models/
         num_train_epochs=1,  # 継続事前学習は通常1エポック
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation,
-        warmup_steps=100,
-        max_steps=1000,
+        warmup_steps=50,  # 削減
+        max_steps=500,  # 削減
         learning_rate=5e-5,  # 継続事前学習では低めの学習率
         fp16=True,
-        bf16=False,  # RTX 2080 TiはBF16非対応
+        bf16=False,  # BF16非対応
         logging_steps=20,
         optim="paged_adamw_8bit",
         weight_decay=0.01,
         lr_scheduler_type="cosine",
         seed=3407,
         save_strategy="steps",
-        save_steps=200,
-        save_total_limit=2,  # ディスク容量節約
+        save_steps=100,  # 削減
+        save_total_limit=1,  # ディスク容量節約
         push_to_hub=False,
         report_to="tensorboard",
         logging_dir=f"{output_dir}/logs",
         gradient_checkpointing=True,
         dataloader_pin_memory=False,  # メモリ節約
+        dataloader_num_workers=1,  # 削減
     )
     
     trainer = SFTTrainer(
@@ -150,8 +155,8 @@ def continued_pretrain(model, tokenizer, dataset, output_dir="/workspace/models/
         train_dataset=dataset,
         dataset_text_field="text",
         max_seq_length=max_seq,
-        dataset_num_proc=4,
-        packing=True,  # 継続事前学習では効率化のためpackingを使用
+        dataset_num_proc=2,
+        packing=False,  # 10.8GBではpackingを無効化（安定性重視）
         args=training_args,
     )
     
@@ -178,10 +183,10 @@ def continued_pretrain(model, tokenizer, dataset, output_dir="/workspace/models/
         
     except torch.cuda.OutOfMemoryError as e:
         print(f"\n❌ OOM Error: {e}")
-        print("\n12GB VRAM用の推奨設定:")
+        print("\n10.8GB VRAM用の推奨設定:")
         print("  1. batch_size=1 を使用")
-        print("  2. max_seq_length=1024 に削減")
-        print("  3. packing=False に変更")
+        print("  2. max_seq_length=512 に削減")
+        print("  3. より小さいモデル (gemma-2b) を使用")
         cleanup_memory()
         raise
     finally:
@@ -190,15 +195,15 @@ def continued_pretrain(model, tokenizer, dataset, output_dir="/workspace/models/
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Continued pre-training for RTX 2080 Ti")
+    parser = argparse.ArgumentParser(description="Continued pre-training for 10.8GB VRAM")
     parser.add_argument("--model", type=str, default="unsloth/llama-2-7b",
                        help="Base model name or path to finetuned model")
     parser.add_argument("--data", type=str, required=True,
                        help="Path to pre-training data")
     parser.add_argument("--output", type=str, default="/workspace/models/continued_pretrained",
                        help="Output directory")
-    parser.add_argument("--max-seq-length", type=int, default=2048,
-                       help="Maximum sequence length (max 2048 for 12GB)")
+    parser.add_argument("--max-seq-length", type=int, default=1024,
+                       help="Maximum sequence length (max 1536 for 10.8GB, 1024 recommended)")
     
     args = parser.parse_args()
     
